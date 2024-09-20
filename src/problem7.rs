@@ -1,15 +1,82 @@
-use std::{collections::HashSet, fmt};
+use core::fmt;
+use std::{
+    collections::HashSet,
+    ops::{Index, IndexMut},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::common::*;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Square {
-    Given(usize),
-    FollowedOnlyRoute(usize),
-    Unknown,
+type Square = Option<usize>;
+type Path = Vec<Coordinate>;
+
+static ROWS: AtomicUsize = AtomicUsize::new(0);
+static COLS: AtomicUsize = AtomicUsize::new(0);
+
+fn rows() -> usize {
+    ROWS.load(Ordering::Relaxed)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+fn cols() -> usize {
+    COLS.load(Ordering::Relaxed)
+}
+
+fn num_squares() -> usize {
+    rows() * cols()
+}
+
+#[derive(Clone, Debug)]
+struct Board(Vec<Vec<Square>>);
+
+impl Board {
+    fn apply_path(&mut self, p: Path, i: usize) {
+        for coord in p {
+            self[coord] = Some(i);
+        }
+    }
+
+    fn apply_paths(&mut self, paths: Vec<Path>) {
+        for (i, p) in paths.into_iter().enumerate() {
+            self.apply_path(p, i);
+        }
+    }
+
+    fn to_string(&self, given: Vec<(Coordinate, Coordinate)>) -> String {
+        let mut use_nums = given
+            .iter()
+            .flat_map(|(a, b)| [*a, *b])
+            .collect::<HashSet<_>>();
+
+        let mut s = String::new();
+
+        for i in 0..rows() {
+            for j in 0..cols() {
+                let coord = Coordinate::new(i, j);
+
+                match self[coord] {
+                    Some(n) if use_nums.contains(&coord) => {
+                        s.push((b'1' + n as u8) as char);
+                    }
+                    Some(n) => {
+                        s.push((b'a' + n as u8) as char);
+                        use_nums.insert(coord);
+                    }
+                    None => {
+                        s.push('.');
+                    }
+                }
+
+                s.push(' ');
+            }
+
+            s.push('\n');
+        }
+
+        s
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 #[repr(usize)]
 enum Direction {
     Up,
@@ -20,510 +87,291 @@ enum Direction {
 
 impl Direction {
     const ALL: [Self; 4] = [Self::Up, Self::Down, Self::Left, Self::Right];
-
-    fn opposite(&self) -> Self {
-        match self {
-            Self::Up => Self::Down,
-            Self::Down => Self::Up,
-            Self::Left => Self::Right,
-            Self::Right => Self::Left,
-        }
-    }
-
-    fn apply_offset(&self, coord: (usize, usize)) -> Option<(usize, usize)> {
-        let offset = [(-1, 0), (1, 0), (0, -1), (0, 1)][*self as usize];
-
-        let newi = coord.0 as i32 + offset.0;
-        let newj = coord.1 as i32 + offset.1;
-
-        if newi < 0 || newj < 0 {
-            return None;
-        }
-
-        Some((newi as usize, newj as usize))
-    }
-
-    fn fromoffset(a: (usize, usize), b: (usize, usize)) -> Option<Self> {
-        for dir in Self::ALL {
-            if dir.apply_offset(a) == Some(b) {
-                return Some(dir);
-            }
-        }
-
-        None
-    }
 }
 
-impl Square {
-    fn unknown(&self) -> bool {
-        match self {
-            Square::Unknown => true,
-            _ => false,
-        }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Coordinate {
+    x: usize,
+    y: usize,
+}
+
+impl Coordinate {
+    fn new(x: usize, y: usize) -> Self {
+        Self { x, y }
     }
 
-    fn value(&self) -> Option<usize> {
-        match self {
-            Square::FollowedOnlyRoute(i) => Some(*i),
-            Square::Given(i) => Some(*i),
+    fn origin() -> Self {
+        Self { x: 0, y: 0 }
+    }
+
+    fn min_distance(&self, other: Self) -> usize {
+        (self.x as isize - other.x as isize).abs() as usize
+            + (self.y as isize - other.y as isize).abs() as usize
+    }
+
+    fn offset(&self, d: Direction) -> Option<Self> {
+        // ensure we dont exceed rows and cols
+        match d {
+            Direction::Up if self.y > 0 => Some(Self::new(self.x, self.y - 1)),
+            Direction::Down if self.y + 1 < rows() => Some(Self::new(self.x, self.y + 1)),
+            Direction::Left if self.x > 0 => Some(Self::new(self.x - 1, self.y)),
+            Direction::Right if self.x + 1 < cols() => Some(Self::new(self.x + 1, self.y)),
             _ => None,
         }
     }
 }
 
+impl fmt::Display for Coordinate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+impl Index<Coordinate> for Board {
+    type Output = Square;
+
+    fn index(&self, index: Coordinate) -> &Self::Output {
+        &self.0[index.y][index.x]
+    }
+}
+
+impl IndexMut<Coordinate> for Board {
+    fn index_mut(&mut self, index: Coordinate) -> &mut Self::Output {
+        &mut self.0[index.y][index.x]
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PathGenerator {
+    paths: Vec<Vec<Path>>,
+    targets: Vec<(Coordinate, Coordinate)>,
+}
+
+impl PathGenerator {
+    fn new(givens: Vec<(Coordinate, Coordinate)>) -> Self {
+        let mut targets = vec![(Coordinate::origin(), Coordinate::origin()); givens.len()];
+
+        for (i, (start, end)) in givens.into_iter().enumerate() {
+            targets[i] = (start, end);
+        }
+
+        Self {
+            paths: vec![vec![]; targets.len()],
+            targets,
+        }
+    }
+
+    // the maximum length of the path that can be generated
+    // for any given target
+    fn max_path_len(&self, n: usize) -> usize {
+        num_squares()
+            - self
+                .targets
+                .iter()
+                .enumerate()
+                .map(|(i, (a, b))| {
+                    if i < n {
+                        self.paths[i][0].len()
+                    } else if i != n {
+                        a.min_distance(*b)
+                    } else {
+                        0
+                    }
+                })
+                .sum::<usize>()
+    }
+
+    fn generate(&mut self, n: usize) {
+        let (src, dest) = self.targets[n];
+        let max_len = self.max_path_len(n);
+
+        let mut traceback = vec![Direction::ALL.into_iter()];
+        let mut visited =
+            HashSet::<Coordinate>::from_iter(self.targets.iter().flat_map(|(a, b)| [*a, *b]));
+        let mut path = vec![src];
+
+        visited.remove(&dest);
+
+        while let Some(coord) = path.last()
+            && let Some(directions) = traceback.last_mut()
+        {
+            // if too long, backtrack
+            if path.len() >= max_len {
+                traceback.pop();
+                visited.remove(&path.pop().unwrap());
+                continue;
+            }
+
+            // get the next coordinate
+            let coord = directions.find_map(|direction| {
+                coord
+                    .offset(direction)
+                    .filter(|coordinate| !visited.contains(coordinate))
+            });
+
+            // if no more coords, backtrack
+            let Some(coord) = coord else {
+                traceback.pop();
+                visited.remove(&path.pop().unwrap());
+                continue;
+            };
+
+            // if we reached the target, add the path
+            // there still may be more available next
+            // directions, so don't backtrack
+            if coord == dest {
+                self.paths[n].push({
+                    let mut path = path.clone();
+                    path.push(coord);
+                    path
+                });
+
+                continue;
+            }
+
+            // add the coord to the path
+            // and set up for next iter
+            path.push(coord);
+            visited.insert(coord);
+            traceback.push(Direction::ALL.into_iter());
+        }
+
+        self.paths[n].sort_unstable_by_key(Vec::len);
+    }
+
+    fn generate_all(&mut self) {
+        for i in 0..self.targets.len() {
+            self.generate(i);
+        }
+    }
+
+    fn collect(self) -> Vec<Vec<Path>> {
+        self.paths
+    }
+}
+
+#[derive(Clone, Debug)]
 struct PathChooser {
-    paths: Vec<Vec<Vec<(usize, usize)>>>,
-    empty: usize,
+    paths: Vec<Vec<Path>>,
+    chosen: Vec<usize>,
+    visited: HashSet<Coordinate>,
 }
 
 impl PathChooser {
-    pub fn new(paths: Vec<((usize, usize), Vec<Vec<Direction>>)>, empty: usize) -> Self {
-        let mut paths = paths
-            .into_iter()
-            .map(|(src, paths)| {
-                let mut listpoints = vec![vec![src]; paths.len()];
-
-                for (i, path) in paths.into_iter().enumerate() {
-                    let points = &mut listpoints[i];
-
-                    for dir in path {
-                        points.push(dir.apply_offset(*points.last().unwrap()).unwrap())
-                    }
-                }
-
-                listpoints.sort_unstable_by_key(Vec::len);
-
-                listpoints
-            })
-            .collect::<Vec<_>>();
-
-        // .len() contains starting and endpoint squares. they will not be newly occupied
-        let minnewsquares = paths.iter().map(|v| v[0].len() - 2).collect::<Vec<_>>();
-
-        // get the sum of minimum lengths, excluding the one with your number on it
-        let minlengths_except = |n: usize| {
-            minnewsquares
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != n)
-                .map(|(_, a)| *a)
-                .sum::<usize>()
-        };
-
-        paths.iter_mut().enumerate().for_each(|(pathid, paths)| {
-            paths.retain(|path| path.len() <= empty - minlengths_except(pathid))
-        });
-
-        Self { paths, empty }
+    fn new(paths: Vec<Vec<Path>>) -> Self {
+        Self {
+            chosen: vec![0; paths.len()],
+            visited: HashSet::new(),
+            paths,
+        }
     }
 
-    fn backtrack<'a: 'b, 'b>(
-        &'a self,
-        n: usize,
-        occupied: &mut HashSet<(usize, usize)>,
-        collect: &mut Vec<&'b Vec<(usize, usize)>>,
-        skip: &mut Vec<usize>,
-        lengths: &mut Vec<usize>,
-    ) {
-        if skip[n] >= lengths[n] {
-            if n == 0 {
-                println!("NO SOLUTION");
-                std::process::exit(0);
-            }
-
-            return self.backtrack(n - 1, occupied, collect, skip, lengths);
+    fn backtrack(&mut self, n: usize) {
+        for coord in &self.paths[n][self.chosen[n]] {
+            self.visited.remove(coord);
         }
 
-        for i in n..self.paths.len() {
-            if let Some(squares) = collect.get(i) {
-                for sq in *squares {
-                    if !occupied.remove(sq) {
-                        panic!("wtf")
-                    }
-                }
-            }
-
-            // we want to keep skip[n], for incrementing
-            // we want to keep lengths[n], because it's not changing
-            if i != n {
-                skip[i] = 0;
-                lengths[i] = 0;
-            }
+        if n + 1 < self.chosen.len() {
+            self.chosen[n + 1] = 0;
         }
 
-        collect.truncate(n);
+        self.chosen[n] += 1;
 
-        // choose the next path of the "bad" path
-        skip[n] += 1;
-
-        self.find(n, occupied, collect, skip, lengths);
+        self.choose(n);
     }
 
-    fn find<'a: 'b, 'b>(
-        &'a self,
-        n: usize,
-        occupied: &mut HashSet<(usize, usize)>,
-        collect: &mut Vec<&'b Vec<(usize, usize)>>,
-        skip: &mut Vec<usize>,
-        lengths: &mut Vec<usize>,
-    ) {
-        if n >= lengths.len() {
-            if occupied.len() != self.empty {
-                self.backtrack(n, occupied, collect, skip, lengths);
+    fn choose(&mut self, n: usize) {
+        if n == self.paths.len() {
+            if self.visited.len() != num_squares() {
+                // we have not filled the grid,
+                // therefore this is not a valid solution
+                self.backtrack(n - 1);
             }
 
             return;
         }
 
-        // filter all the paths that could possibly be chosen
-        let possible = self.paths[n]
-            .iter()
-            .filter(|v| v.iter().all(|n| !occupied.contains(n)))
-            .collect::<Vec<_>>();
+        while self.chosen[n] < self.paths[n].len() {
+            let path = &self.paths[n][self.chosen[n]];
 
-        // list how many there are for backtracking
-        lengths[n] = possible.len();
+            if path.iter().all(|n| !self.visited.contains(n)) {
+                for &coord in path {
+                    self.visited.insert(coord);
+                }
 
-        // take the first
-        let chosen = possible.get(skip[n]);
-
-        // if there is one...
-        if let Some(chosen) = chosen {
-            for it in *chosen {
-                // occupy the squares
-                occupied.insert(*it);
-            }
-
-            // add it to the results
-            collect.push(chosen);
-
-            // choose the next item
-            self.find(n + 1, occupied, collect, skip, lengths);
-        } else {
-            // backtrack!
-            self.backtrack(n, occupied, collect, skip, lengths);
-        }
-    }
-
-    fn choose<'a: 'b, 'b>(&'a self, collect: &mut Vec<&'b Vec<(usize, usize)>>) {
-        let mut occupied = HashSet::new();
-        let mut skip = vec![0; self.paths.len()];
-        let mut lengths = vec![0; self.paths.len()];
-
-        self.find(0, &mut occupied, collect, &mut skip, &mut lengths);
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct Board {
-    squares: Vec<Vec<Square>>,
-    maxnum: usize,
-}
-
-impl Board {
-    pub fn new(rows: usize, cols: usize, indexes: Vec<((usize, usize), (usize, usize))>) -> Self {
-        let mut squares = vec![vec![Square::Unknown; rows]; cols];
-
-        for (i, ((r1, c1), (r2, c2))) in indexes.iter().enumerate() {
-            squares[*r1][*c1] = Square::Given(i);
-            squares[*r2][*c2] = Square::Given(i);
-        }
-
-        Self {
-            squares,
-            maxnum: indexes.len(),
-        }
-    }
-
-    pub fn get_mut(&mut self, i: usize, j: usize) -> Option<&mut Square> {
-        if i < self.squares.len() && j < self.squares[0].len() {
-            Some(&mut self.squares[i][j])
-        } else {
-            None
-        }
-    }
-
-    pub fn get(&self, i: usize, j: usize) -> Option<&Square> {
-        if i < self.squares.len() && j < self.squares[0].len() {
-            Some(&self.squares[i][j])
-        } else {
-            None
-        }
-    }
-
-    pub fn surrounding_mut<'a>(
-        &'a mut self,
-        i: usize,
-        j: usize,
-    ) -> Vec<(&'a mut Square, (usize, usize))> {
-        const MAP: [(i8, i8); 4] = [(0, 1), (0, -1), (-1, 0), (1, 0)];
-
-        let mut squares = vec![];
-
-        for (offr, offc) in MAP {
-            let newr = i as i8 + offr;
-            let newc = j as i8 + offc;
-
-            if newr < 0 || newc < 0 {
+                return self.choose(n + 1);
+            } else {
+                self.chosen[n] += 1;
                 continue;
             }
-
-            let newr = newr as usize;
-            let newc = newc as usize;
-
-            if let Some(item) = self.get_mut(newr, newc) {
-                squares.push((item as *mut Square, (newr, newc)));
-            }
         }
 
-        // SAFETY: these will be different elements in the array, therefore its safe
-        squares
-            .into_iter()
-            .map(|(sq, rc)| (unsafe { &mut *sq }, rc))
-            .collect()
-    }
-
-    pub fn surrounding(&self, i: usize, j: usize) -> Vec<(&Square, (usize, usize))> {
-        let mut squares = vec![];
-
-        for dir in Direction::ALL {
-            if let Some((newr, newc)) = dir.apply_offset((i, j))
-                && let Some(item) = self.get(newr, newc)
-            {
-                squares.push((item, (newr, newc)));
-            }
+        if n == 0 {
+            println!("NO SOLUTION");
+            std::process::exit(0);
         }
 
-        squares
+        self.backtrack(n - 1);
     }
 
-    pub fn set_oneway(&mut self, i: usize, j: usize, val: usize) -> bool {
-        let surrounding = self.surrounding_mut(i, j);
-        let mut surrounding = surrounding.into_iter().filter(|(sq, _)| sq.unknown());
-        let nextrow;
-        let nextcol;
-
-        if let Some((next, (row, col))) = surrounding.next()
-            && surrounding.next() == None
-        {
-            *next = Square::FollowedOnlyRoute(val);
-            nextrow = row;
-            nextcol = col;
-        } else {
-            return false;
-        }
-
-        // SAFETY: surrounding has no items (or we would have returned), therefore
-        // there will not be two mutable references to the same value
-        self.set_oneway(nextrow, nextcol, val);
-
-        true
-    }
-
-    pub fn oneway_all(&mut self) -> bool {
-        let mut result = false;
-
-        for i in 0..self.squares.len() {
-            for j in 0..self.squares[0].len() {
-                if let Some(Square::Given(ref val)) = self.get_mut(i, j) {
-                    let val = *val;
-
-                    result |= self.set_oneway(i, j, val);
-                }
-            }
-        }
-
-        result
-    }
-
-    pub fn oneway_forever(&mut self) {
-        while self.oneway_all() {}
-    }
-
-    pub fn pos_routes(
-        &self,
-        src: (usize, usize),
-        traversed: Vec<(usize, usize)>,
-        val: usize,
-    ) -> Vec<Vec<Direction>> {
-        let mut routes = vec![];
-        let (fromr, fromc) = src;
-
-        let directions = Direction::ALL.to_vec();
-
-        let goto = directions
+    fn trim(&mut self) {
+        let min_lengths = self
+            .paths
             .iter()
-            .filter_map(|dir| {
-                let Some((newr, newc)) = dir.apply_offset((fromr, fromc)) else {
-                    return None;
-                };
-
-                if traversed.contains(&(newr, newc)) {
-                    return None;
-                }
-
-                if self.get(newr, newc).copied() == Some(Square::Unknown) {
-                    Some((newr, newc, *dir, false))
-                } else if self.get(newr, newc).copied() == Some(Square::Given(val))
-                    || self.get(newr, newc).copied() == Some(Square::FollowedOnlyRoute(val))
-                {
-                    Some((newr, newc, *dir, true))
-                } else {
-                    None
-                }
-            })
+            .map(|paths| paths[0].len())
             .collect::<Vec<_>>();
 
-        let threads = goto.into_iter().map(|(newr, newc, offset, ended)| {
-            let mut traversed = traversed.clone();
+        let total_min_length = min_lengths.iter().sum::<usize>();
+        let num_squares = num_squares();
 
-            // thread::spawn(move || {
-            if ended {
-                vec![vec![offset]]
-            } else {
-                traversed.push((newr, newc));
-
-                self.pos_routes((newr, newc), traversed, val)
-                    .into_iter()
-                    .filter(|n| !n.is_empty())
-                    .map(|mut n| {
-                        n.insert(0, offset);
-                        n
-                    })
-                    .collect()
-            }
-            // })
-        });
-
-        for t in threads {
-            // let t = t.join().unwrap()
-            routes.extend(t);
-        }
-
-        routes
-    }
-
-    pub fn follow_value(
-        &self,
-        i: usize,
-        j: usize,
-        prv: Option<Direction>,
-        val: usize,
-        traversed: &mut Vec<(usize, usize)>,
-    ) -> &Square {
-        traversed.push((i, j));
-
-        let mut surrounding = self.surrounding(i, j).into_iter().filter(|(it, sq)| {
-            it.value() == Some(val)
-                && if let Some(prv) = prv {
-                    Some(*sq) != prv.opposite().apply_offset((i, j))
-                } else {
-                    true
-                }
-        });
-
-        if let Some((_, newcoords)) = surrounding.next() {
-            let (newi, newj) = newcoords;
-            let nextdir = Direction::fromoffset((i, j), newcoords).unwrap();
-
-            self.follow_value(newi, newj, Some(nextdir), val, traversed)
-        } else {
-            self.get(i, j).unwrap()
+        for (i, paths) in self.paths.iter_mut().enumerate() {
+            let max_length = num_squares - (total_min_length - min_lengths[i]);
+            paths.retain(|path| path.len() <= max_length);
         }
     }
 
-    pub fn all_paths(&self) -> PathChooser {
-        let mut follows = vec![None; self.maxnum];
-        let mut paths = Vec::with_capacity(self.maxnum);
-
-        for i in 0..self.squares.len() {
-            for j in 0..self.squares[0].len() {
-                if let Some(Square::Given(val)) = self.get(i, j)
-                    && follows[*val] == None
-                {
-                    let mut traversed = vec![];
-                    self.follow_value(i, j, None, *val, &mut traversed);
-
-                    follows[*val] = Some((*traversed.last().unwrap(), traversed, *val))
-                }
-            }
-        }
-
-        for (src, traversed, val) in follows.into_iter().map(Option::unwrap) {
-            paths.push((src, self.pos_routes(src, traversed, val)));
-        }
-
-        PathChooser::new(paths, self.empty())
+    fn choose_all(&mut self) {
+        self.trim();
+        self.choose(0);
     }
 
-    fn fill_if_unfilled(&mut self, value: usize, coord: (usize, usize)) {
-        let (x, y) = coord;
-
-        match self.get_mut(x, y).unwrap() {
-            Square::FollowedOnlyRoute(_) | Square::Given(_) => {}
-            sq => *sq = Square::FollowedOnlyRoute(value),
-        }
-    }
-
-    pub fn apply(&mut self, app: Vec<&Vec<(usize, usize)>>) {
-        for (id, path) in app.into_iter().enumerate() {
-            for coord in path {
-                self.fill_if_unfilled(id, *coord);
-            }
-        }
-    }
-
-    pub fn empty(&self) -> usize {
-        self.squares
-            .iter()
-            .map(|sqs| sqs.iter().filter(|n| n.unknown()).count())
-            .sum()
-    }
-}
-
-impl fmt::Display for Board {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for row in &self.squares {
-            for square in row {
-                match square {
-                    Square::Given(nu) => write!(f, "{}", nu + 1)?,
-                    Square::FollowedOnlyRoute(nu) => {
-                        write!(f, "{}", ('a' as u8 + *nu as u8) as char)?
-                    }
-                    Square::Unknown => write!(f, "-")?,
-                }
-            }
-
-            write!(f, "\n")?;
-        }
-
-        write!(f, "")
+    fn collect(self) -> Vec<Path> {
+        self.paths
+            .into_iter()
+            .zip(self.chosen)
+            .map(|(mut paths, chosen)| paths.swap_remove(chosen))
+            .collect()
     }
 }
 
 pub fn main() {
-    let [rows, columns, nums] = read_line_vec::<usize>(" ")[..] else {
+    let [rows, cols, nums] = read_line_vec(" ")[..] else {
         panic!()
     };
 
-    let mut idxs = vec![];
+    ROWS.store(rows, Ordering::Relaxed);
+    COLS.store(cols, Ordering::Relaxed);
+
+    let mut coordinates = vec![];
 
     for _ in 0..nums {
-        let [x1, y1, x2, y2] = read_line_vec::<usize>(" ")[..] else {
+        let [x1, y1, x2, y2] = read_line_vec(" ")[..] else {
             panic!()
         };
 
-        idxs.push(((x1, y1), (x2, y2)));
+        coordinates.push((Coordinate::new(x1, y1), Coordinate::new(x2, y2)));
     }
 
-    let mut board = Board::new(rows, columns, idxs);
-    board.oneway_forever();
+    let mut generator = PathGenerator::new(coordinates.clone());
+    let mut board = Board(vec![vec![None; cols]; rows]);
+    generator.generate_all();
 
-    let chooser = board.all_paths();
-    let mut paths = Vec::new();
-    chooser.choose(&mut paths);
+    let paths = generator.collect();
+    let mut chooser = PathChooser::new(paths);
+    chooser.choose_all();
 
-    board.apply(paths);
+    let paths = chooser.collect();
+    board.apply_paths(paths);
 
-    print!("{board}");
+    println!("{}", board.to_string(coordinates));
 }
